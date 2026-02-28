@@ -1,7 +1,10 @@
 import html
+import json
 import re
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
@@ -11,13 +14,13 @@ from scipy.sparse import csr_matrix, hstack
 
 MODEL_FILE = Path("helpfulness_model.pkl")
 VECTORIZER_FILE = Path("helpfulness_vectorizer.pkl")
+METADATA_FILE = Path("helpfulness_metadata.json")
 
 DEFAULT_CONFIDENCE_THRESHOLD = 0.70
+DEFAULT_DECISION_THRESHOLD = 0.50
 LONG_REVIEW_MIN_WORDS = 20
-EXPECTED_FEATURE_COUNT = 5001
-EXPECTED_TFIDF_COUNT = 5000
 
-DATASET_STATS = {
+DEFAULT_DATASET_STATS = {
     "raw_rows": 568454,
     "valid_rows": 298402,
     "training_sample": 100000,
@@ -98,11 +101,47 @@ def inject_styles() -> None:
     )
 
 
+def build_dataset_stats(metadata: dict[str, Any]) -> dict[str, Any]:
+    stats = dict(DEFAULT_DATASET_STATS)
+    dataset_meta = metadata.get("dataset", {})
+
+    if dataset_meta:
+        stats["raw_rows"] = dataset_meta.get("raw_rows", stats["raw_rows"])
+        stats["valid_rows"] = dataset_meta.get(
+            "valid_rows_post_filters", stats["valid_rows"]
+        )
+        stats["training_sample"] = dataset_meta.get(
+            "training_rows", stats["training_sample"]
+        )
+        helpful_pct = dataset_meta.get("class_1_pct")
+        not_helpful_pct = dataset_meta.get("class_0_pct")
+        if helpful_pct is not None:
+            stats["helpful_pct"] = float(helpful_pct)
+        if not_helpful_pct is not None:
+            stats["not_helpful_pct"] = float(not_helpful_pct)
+
+    return stats
+
+
+def get_vectorizer_feature_count(vectorizer_obj: Any) -> int:
+    if hasattr(vectorizer_obj, "vocabulary_") and vectorizer_obj.vocabulary_:
+        return int(len(vectorizer_obj.vocabulary_))
+    if hasattr(vectorizer_obj, "get_feature_names_out"):
+        try:
+            return int(len(vectorizer_obj.get_feature_names_out()))
+        except Exception:
+            pass
+    raise ValueError(
+        "Unable to determine vectorizer feature count from vocabulary_ "
+        "or get_feature_names_out()."
+    )
+
+
 @st.cache_resource
-def load_model() -> tuple[object | None, object | None, str | None]:
+def load_model() -> tuple[object | None, object | None, dict[str, Any], str | None]:
     try:
         if not MODEL_FILE.exists() or not VECTORIZER_FILE.exists():
-            return None, None, (
+            return None, None, {}, (
                 "Model artifacts not found. Expected files in app directory: "
                 f"{MODEL_FILE.name}, {VECTORIZER_FILE.name}."
             )
@@ -110,31 +149,107 @@ def load_model() -> tuple[object | None, object | None, str | None]:
         loaded_model = joblib.load(MODEL_FILE)
         loaded_vectorizer = joblib.load(VECTORIZER_FILE)
 
-        if not hasattr(loaded_vectorizer, "vocabulary_"):
-            return None, None, "Vectorizer is missing vocabulary_ and is not usable."
+        metadata: dict[str, Any] = {}
+        if METADATA_FILE.exists():
+            metadata = json.loads(METADATA_FILE.read_text(encoding="utf-8"))
 
-        vocab_size = len(loaded_vectorizer.vocabulary_)
+        try:
+            vocab_size = get_vectorizer_feature_count(loaded_vectorizer)
+        except ValueError as exc:
+            return None, None, metadata, str(exc)
+
         model_features = getattr(loaded_model, "n_features_in_", None)
         if model_features is None:
-            return None, None, "Model is missing n_features_in_ compatibility metadata."
+            return None, None, metadata, "Model is missing n_features_in_ compatibility metadata."
 
-        if vocab_size + 1 != model_features:
-            return None, None, (
-                "Feature mismatch detected. Expected vectorizer_vocab + 1 == "
-                f"model_features, got {vocab_size} + 1 != {model_features}."
+        model_meta = metadata.get("model", {})
+        numeric_features = model_meta.get("numeric_features")
+        inferred_numeric_count = max(int(model_features) - int(vocab_size), 1)
+        expected_numeric_count = (
+            len(numeric_features)
+            if isinstance(numeric_features, list) and numeric_features
+            else inferred_numeric_count
+        )
+
+        if vocab_size + expected_numeric_count != model_features:
+            return None, None, metadata, (
+                "Feature mismatch detected. Expected vectorizer_vocab + "
+                f"numeric_feature_count == model_features, got {vocab_size} + "
+                f"{expected_numeric_count} != {model_features}."
             )
 
-        return loaded_model, loaded_vectorizer, None
+        return loaded_model, loaded_vectorizer, metadata, None
     except Exception as exc:
-        return None, None, f"Error loading model artifacts: {exc}"
+        return None, None, {}, f"Error loading model artifacts: {exc}"
 
 
 def preprocess_text(text: str) -> str:
     cleaned = str(text).lower()
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
     cleaned = re.sub(r"[^\w\s]", "", cleaned)
     cleaned = re.sub(r"\d+", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+def resolve_tfidf_feature_count(
+    vectorizer_obj: Any,
+    model_meta: dict[str, Any],
+    model_feature_count: int,
+) -> int:
+    try:
+        return get_vectorizer_feature_count(vectorizer_obj)
+    except Exception:
+        pass
+
+    metadata_vocab_size = model_meta.get("vectorizer_vocab_size")
+    if isinstance(metadata_vocab_size, (int, float)) and int(metadata_vocab_size) > 0:
+        return int(metadata_vocab_size)
+
+    metadata_numeric_features = model_meta.get("numeric_features")
+    numeric_feature_count = (
+        len(metadata_numeric_features)
+        if isinstance(metadata_numeric_features, list) and metadata_numeric_features
+        else 1
+    )
+    return max(int(model_feature_count) - int(numeric_feature_count), 1)
+
+
+def compute_semantic_score(cleaned_text: str) -> float:
+    tokens = cleaned_text.split()
+    if not tokens:
+        return 0.0
+
+    token_count = len(tokens)
+    unique_ratio = len(set(tokens)) / token_count
+    top_token_ratio = max(Counter(tokens).values()) / token_count
+    alpha_char_ratio = sum(char.isalpha() for char in cleaned_text) / max(
+        len(cleaned_text), 1
+    )
+    semantic_score = (
+        0.45 * unique_ratio
+        + 0.35 * (1.0 - top_token_ratio)
+        + 0.20 * alpha_char_ratio
+    )
+    return float(np.clip(semantic_score, 0.0, 1.0))
+
+
+def build_numeric_feature_vector(cleaned_text: str, review_length: int) -> csr_matrix:
+    numeric_values: list[float] = []
+    for feature_name in model_numeric_features:
+        if feature_name == "review_length_log_scaled":
+            log_min = float(model_length_scaler.get("log_min", 0.0))
+            log_range = max(float(model_length_scaler.get("log_range", 1.0)), 1e-6)
+            scaled = (float(np.log1p(review_length)) - log_min) / log_range
+            numeric_values.append(float(np.clip(scaled, 0.0, 1.0)))
+        elif feature_name == "semantic_score":
+            numeric_values.append(compute_semantic_score(cleaned_text))
+        elif feature_name == "review_length_raw":
+            numeric_values.append(float(review_length))
+        else:
+            raise ValueError(f"Unsupported numeric feature in metadata: {feature_name}")
+
+    return csr_matrix(np.array([numeric_values], dtype=float))
 
 
 def predict_helpfulness(review_text: str, threshold: float) -> dict | None:
@@ -144,18 +259,19 @@ def predict_helpfulness(review_text: str, threshold: float) -> dict | None:
 
     tfidf_feature = vectorizer.transform([cleaned_text])
     review_length = len(cleaned_text.split())
-    length_feature = csr_matrix(np.array([[review_length]], dtype=float))
-    features = hstack([tfidf_feature, length_feature], format="csr")
+    numeric_feature = build_numeric_feature_vector(cleaned_text, review_length)
+    features = hstack([tfidf_feature, numeric_feature], format="csr")
 
-    if features.shape[1] != EXPECTED_FEATURE_COUNT:
+    if features.shape[1] != model_feature_count:
         raise ValueError(
             f"Unexpected feature width {features.shape[1]}; expected "
-            f"{EXPECTED_FEATURE_COUNT}."
+            f"{model_feature_count}."
         )
 
-    prediction = int(model.predict(features)[0])
     probabilities = model.predict_proba(features)[0]
-    confidence = float(probabilities[prediction])
+    helpful_probability = float(probabilities[1])
+    prediction = int(helpful_probability >= decision_threshold)
+    confidence = float(max(helpful_probability, 1.0 - helpful_probability))
     label = "Helpful" if prediction == 1 else "Not Helpful"
 
     return {
@@ -164,6 +280,7 @@ def predict_helpfulness(review_text: str, threshold: float) -> dict | None:
         "prediction": prediction,
         "label": label,
         "confidence": confidence,
+        "helpful_probability": helpful_probability,
         "word_count": review_length,
         "is_low_confidence": confidence < threshold,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -192,6 +309,7 @@ def render_prediction_card(record: dict, threshold: float) -> None:
                 <span class="badge {badge_class}">{badge_icon} {record["label"]}</span>
             </div>
             <div class="meta">
+                Helpful Probability: {record["helpful_probability"] * 100:.2f}% |
                 Confidence: {record["confidence"] * 100:.2f}% |
                 Word Count: {record["word_count"]} |
                 Low Confidence: {"Yes" if is_low_confidence else "No"} |
@@ -215,6 +333,7 @@ def render_history_card(record: dict, threshold: float) -> None:
             <span class="badge {badge_class}">{badge_icon} {record["label"]}</span>
             <div style="margin-top:0.4rem;">{safe_review}</div>
             <div class="meta">
+                Helpful Prob: {record["helpful_probability"] * 100:.2f}% |
                 Confidence: {record["confidence"] * 100:.2f}% |
                 Words: {record["word_count"]} |
                 Low Confidence: {"Yes" if is_low_confidence else "No"} |
@@ -248,14 +367,50 @@ def filter_history(
 inject_styles()
 init_session_state()
 
-model, vectorizer, load_error = load_model()
+model, vectorizer, metadata, load_error = load_model()
+
+if load_error:
+    st.error(load_error)
+    st.stop()
+
+model_meta = metadata.get("model", {})
+config_meta = metadata.get("config", {})
+
+model_feature_count = int(getattr(model, "n_features_in_", 0))
+tfidf_feature_count = resolve_tfidf_feature_count(
+    vectorizer,
+    model_meta,
+    model_feature_count,
+)
+dataset_stats = build_dataset_stats(metadata)
+dataset_stats["feature_count"] = model_feature_count
+
+selected_model = model_meta.get("selected_model", "Logistic Regression")
+decision_threshold = float(model_meta.get("decision_threshold", DEFAULT_DECISION_THRESHOLD))
+decision_threshold = min(max(decision_threshold, 0.0), 1.0)
+inferred_numeric_count = max(model_feature_count - tfidf_feature_count, 1)
+model_numeric_features = model_meta.get("numeric_features")
+if not isinstance(model_numeric_features, list) or not model_numeric_features:
+    if inferred_numeric_count == 2:
+        model_numeric_features = ["review_length_log_scaled", "semantic_score"]
+    else:
+        model_numeric_features = ["review_length_raw"]
+model_length_scaler = model_meta.get("length_scaler", {})
+if not isinstance(model_length_scaler, dict):
+    model_length_scaler = {}
+label_rule_threshold = float(
+    config_meta.get("helpfulness_threshold", 0.60)
+)
+bias_flag = bool(metadata.get("fairness", {}).get("bias_flag", False))
+max_recall_gap = float(metadata.get("fairness", {}).get("max_recall_gap", 0.0))
 
 with st.sidebar:
     st.header("Model Information")
     st.markdown(
-        """
-        **Model Type:** Logistic Regression  
-        **Artifacts:** `helpfulness_model.pkl`, `helpfulness_vectorizer.pkl`  
+        f"""
+        **Model Type:** {selected_model}  
+        **Artifacts:** `{MODEL_FILE.name}`, `{VECTORIZER_FILE.name}`  
+        **Decision Threshold:** {decision_threshold:.2f}  
         **Inference Policy:** Rating/Score is not used in prediction.
         """
     )
@@ -263,9 +418,9 @@ with st.sidebar:
     st.divider()
     st.header("Dataset Info")
     st.markdown(
-        """
+        f"""
         **Training Corpus:** Amazon Food Reviews  
-        **Label Rule:** Helpful ratio >= 0.60
+        **Label Rule:** Adjusted helpfulness >= {label_rule_threshold:.2f}
         """
     )
 
@@ -273,9 +428,9 @@ with st.sidebar:
     st.header("Features Used")
     st.markdown(
         f"""
-        - TF-IDF Features: {EXPECTED_TFIDF_COUNT}
-        - Review Length: 1
-        - Total Features: {DATASET_STATS["feature_count"]}
+        - TF-IDF Features: {tfidf_feature_count}
+        - Numeric Features: {len(model_numeric_features)} ({", ".join(model_numeric_features)})
+        - Total Features: {model_feature_count}
         """
     )
 
@@ -293,11 +448,20 @@ with st.sidebar:
     st.header("Dataset Statistics")
     st.markdown(
         f"""
-        - Raw Rows: {DATASET_STATS["raw_rows"]:,}
-        - Valid Rows: {DATASET_STATS["valid_rows"]:,}
-        - Training Sample: {DATASET_STATS["training_sample"]:,}
-        - Helpful: {DATASET_STATS["helpful_pct"]:.2f}%
-        - Not Helpful: {DATASET_STATS["not_helpful_pct"]:.2f}%
+        - Raw Rows: {int(dataset_stats["raw_rows"]):,}
+        - Valid Rows: {int(dataset_stats["valid_rows"]):,}
+        - Training Sample: {int(dataset_stats["training_sample"]):,}
+        - Helpful: {dataset_stats["helpful_pct"]:.2f}%
+        - Not Helpful: {dataset_stats["not_helpful_pct"]:.2f}%
+        """
+    )
+
+    st.divider()
+    st.header("Bias Audit")
+    st.markdown(
+        f"""
+        - Bias Flag: {"Yes" if bias_flag else "No"}
+        - Max Recall Gap: {max_recall_gap:.4f}
         """
     )
 
@@ -308,10 +472,6 @@ with st.sidebar:
     filter_long_reviews = st.checkbox(
         f"Show Long Reviews (> {LONG_REVIEW_MIN_WORDS} words)", value=False
     )
-
-if load_error:
-    st.error(load_error)
-    st.stop()
 
 st.markdown(
     """
