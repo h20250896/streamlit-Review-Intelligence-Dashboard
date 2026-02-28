@@ -623,4 +623,3 @@ if not filtered_history:
 else:
     for item in reversed(filtered_history):
         render_history_card(item, confidence_threshold)
-
