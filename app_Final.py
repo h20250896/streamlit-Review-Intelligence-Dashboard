@@ -123,6 +123,15 @@ def build_dataset_stats(metadata: dict[str, Any]) -> dict[str, Any]:
     return stats
 
 
+def extract_slice_gaps(fairness_report: dict[str, Any], slice_name: str) -> tuple[float, float]:
+    for report in fairness_report.get("slice_reports", []):
+        if report.get("slice_name") == slice_name:
+            gap_1 = float(report.get("recall_gap_class_1", 0.0))
+            gap_0 = float(report.get("recall_gap_class_0", 0.0))
+            return gap_1, gap_0
+    return 0.0, 0.0
+
+
 def get_vectorizer_feature_count(vectorizer_obj: Any) -> int:
     if hasattr(vectorizer_obj, "vocabulary_") and vectorizer_obj.vocabulary_:
         return int(len(vectorizer_obj.vocabulary_))
@@ -273,6 +282,7 @@ def predict_helpfulness(review_text: str, threshold: float) -> dict | None:
     prediction = int(helpful_probability >= decision_threshold)
     confidence = float(max(helpful_probability, 1.0 - helpful_probability))
     label = "Helpful" if prediction == 1 else "Not Helpful"
+    semantic_score = compute_semantic_score(cleaned_text)
 
     return {
         "review_text": review_text,
@@ -282,6 +292,7 @@ def predict_helpfulness(review_text: str, threshold: float) -> dict | None:
         "confidence": confidence,
         "helpful_probability": helpful_probability,
         "word_count": review_length,
+        "semantic_score": semantic_score,
         "is_low_confidence": confidence < threshold,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -312,6 +323,7 @@ def render_prediction_card(record: dict, threshold: float) -> None:
                 Helpful Probability: {record["helpful_probability"] * 100:.2f}% |
                 Confidence: {record["confidence"] * 100:.2f}% |
                 Word Count: {record["word_count"]} |
+                Semantic Score: {record.get("semantic_score", 0.0):.3f} |
                 Low Confidence: {"Yes" if is_low_confidence else "No"} |
                 Timestamp: {record["timestamp"]}
             </div>
@@ -336,6 +348,7 @@ def render_history_card(record: dict, threshold: float) -> None:
                 Helpful Prob: {record["helpful_probability"] * 100:.2f}% |
                 Confidence: {record["confidence"] * 100:.2f}% |
                 Words: {record["word_count"]} |
+                Semantic: {record.get("semantic_score", 0.0):.3f} |
                 Low Confidence: {"Yes" if is_low_confidence else "No"} |
                 {record["timestamp"]}
             </div>
@@ -375,6 +388,8 @@ if load_error:
 
 model_meta = metadata.get("model", {})
 config_meta = metadata.get("config", {})
+runtime_meta = metadata.get("runtime", {})
+fairness_meta = metadata.get("fairness", {})
 
 model_feature_count = int(getattr(model, "n_features_in_", 0))
 tfidf_feature_count = resolve_tfidf_feature_count(
@@ -401,8 +416,24 @@ if not isinstance(model_length_scaler, dict):
 label_rule_threshold = float(
     config_meta.get("helpfulness_threshold", 0.60)
 )
-bias_flag = bool(metadata.get("fairness", {}).get("bias_flag", False))
-max_recall_gap = float(metadata.get("fairness", {}).get("max_recall_gap", 0.0))
+bias_flag = bool(fairness_meta.get("bias_flag", False))
+max_recall_gap = float(fairness_meta.get("max_recall_gap", 0.0))
+
+validation_results = model_meta.get("validation_results", {})
+selected_validation = validation_results.get(selected_model, {})
+threshold_diagnostics = selected_validation.get("threshold_diagnostics", {})
+threshold_macro_f1 = float(threshold_diagnostics.get("macro_f1", 0.0))
+threshold_sentiment_gap = float(threshold_diagnostics.get("sentiment_recall_gap", 0.0))
+threshold_fairness_ok = bool(threshold_diagnostics.get("fairness_compliant", False))
+
+fairness_cfg = config_meta.get("fairness", {})
+sentiment_gap_limit = float(fairness_cfg.get("sentiment_max_recall_gap", 0.12))
+global_gap_limit = float(fairness_cfg.get("max_recall_gap", 0.10))
+
+sentiment_gap_class_1, sentiment_gap_class_0 = extract_slice_gaps(
+    fairness_meta,
+    "sentiment_polarity",
+)
 
 with st.sidebar:
     st.header("Model Information")
@@ -411,9 +442,20 @@ with st.sidebar:
         **Model Type:** {selected_model}  
         **Artifacts:** `{MODEL_FILE.name}`, `{VECTORIZER_FILE.name}`  
         **Decision Threshold:** {decision_threshold:.2f}  
+        **Threshold Macro F1:** {threshold_macro_f1:.4f}  
+        **Threshold Sentiment Gap:** {threshold_sentiment_gap:.4f}  
+        **Threshold Fairness Compliant:** {"Yes" if threshold_fairness_ok else "No"}  
         **Inference Policy:** Rating/Score is not used in prediction.
         """
     )
+
+    if runtime_meta:
+        st.markdown(
+            f"""
+            **Runtime:** Python {runtime_meta.get("python_version", "N/A")}  
+            **Scikit-Learn:** {runtime_meta.get("sklearn_version", "N/A")}
+            """
+        )
 
     st.divider()
     st.header("Dataset Info")
@@ -462,6 +504,10 @@ with st.sidebar:
         f"""
         - Bias Flag: {"Yes" if bias_flag else "No"}
         - Max Recall Gap: {max_recall_gap:.4f}
+        - Allowed Max Gap: {global_gap_limit:.2f}
+        - Sentiment Gap (Class 1): {sentiment_gap_class_1:.4f}
+        - Sentiment Gap (Class 0): {sentiment_gap_class_0:.4f}
+        - Allowed Sentiment Gap: {sentiment_gap_limit:.2f}
         """
     )
 
@@ -577,3 +623,4 @@ if not filtered_history:
 else:
     for item in reversed(filtered_history):
         render_history_card(item, confidence_threshold)
+
